@@ -1,0 +1,11 @@
+name: "dell_idrac_redfish"
+vendor: "Dell Technologies"
+model_match: "PowerEdge R650 / R750 / C6525 (iDRAC9)"
+protocol: "redfish"
+discovery:
+  sys_descr_oid: "iDRAC9 Enterprise Controller"
+redfish:
+  system_path: "/redfish/v1/Systems/System.Embedded.1"
+  chassis_path: "/redfish/v1/Chassis/System.Embedded.1"
+  thermal_path: "/redfish/v1/Chassis/System.Embedded.1/Thermal"
+  power_path: "/redfish/v1/Chassis/System.Embedded.1/Power"

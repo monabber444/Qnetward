@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package ingestion;
+
+option go_package = "netwatcher/proto/ingestion";
+
+// IngestionService defines the high-throughput, bidirectional communication
+// stream between distributed edge probe agents and the Qnetward control plane.
+service IngestionService {
+  // StreamChannel is the persistent bidirectional mTLS streaming channel.
+  // Edge agents send registration, heartbeats, probe results, and PulseMesh matrices.
+  // The control plane responds with registration ACKs, scheduled probe tasks, and config updates.
+  rpc StreamChannel(stream AgentMessage) returns (stream GatewayCommand);
+}
+
+// AgentMessage is an envelope containing telemetry or control messages sent by an edge agent.
+message AgentMessage {
+  int64 timestamp_ns = 1;
+  string agent_id = 2;
+  int64 tenant_id = 3;
+
+  oneof payload {
+    AgentRegister register = 4;
+    AgentHeartbeat heartbeat = 5;
+    ProbeTelemetry probe_result = 6;
+    MeshMatrixTelemetry mesh_matrix = 7;
+    TaskExecutionResult task_result = 8;
+  }
+}
+
+// AgentRegister initiates registration with the Ingestion Gateway.
+message AgentRegister {
+  string hostname = 1;
+  string version = 2;
+  string os = 3;
+  string arch = 4;
+  repeated string capabilities = 5; // e.g. "icmp", "tcpping", "portscan", "dns", "mesh"
+  map<string, string> labels = 6;     // e.g. "region": "us-east", "env": "prod"
+}
+
+// AgentHeartbeat reports agent health and resource status.
+message AgentHeartbeat {
+  double cpu_usage_percent = 1;
+  uint64 memory_used_bytes = 2;
+  int32 active_probes_count = 3;
+  int64 uptime_seconds = 4;
+}
+
+// ProbeTelemetry conveys a single point or batch of ICMP/TCP probe results.
+message ProbeTelemetry {
+  string probe_id = 1;
+  string protocol = 2;        // "icmp", "tcp", "dns", etc.
+  string target = 3;
+  int32 port = 4;
+  int32 sequence = 5;
+  double rtt_ms = 6;
+  string error_message = 7;
+  string resolved_ip = 8;
+  int64 timestamp_ms = 9;
+}
+
+// MeshMatrixTelemetry conveys calculated path-health statistics between PulseMesh cluster peers.
+message MeshMatrixTelemetry {
+  string source_node = 1;
+  string target_node = 2;
+  double p50_rtt_ms = 3;
+  double p95_rtt_ms = 4;
+  double p99_rtt_ms = 5;
+  double jitter_ms = 6;
+  double packet_loss_percent = 7;
+  int64 samples_count = 8;
+  int64 recorded_at_ms = 9;
+}
+
+// TaskExecutionResult reports completion of an assigned probe task.
+message TaskExecutionResult {
+  string task_id = 1;
+  bool success = 2;
+  string error = 3;
+  int64 duration_ms = 4;
+}
+
+// GatewayCommand is an envelope sent from the Control Plane to the edge agent.
+message GatewayCommand {
+  int64 timestamp_ns = 1;
+  string command_id = 2;
+
+  oneof payload {
+    RegistrationAck register_ack = 3;
+    ScheduleProbeTask schedule_task = 4;
+    CancelProbeTask cancel_task = 5;
+    MeshConfigUpdate mesh_config = 6;
+  }
+}
+
+// RegistrationAck acknowledges successful registration.
+message RegistrationAck {
+  bool accepted = 1;
+  string reason = 2;
+  int32 heartbeat_interval_seconds = 3;
+  repeated string mesh_seed_peers = 4;
+}
+
+// ScheduleProbeTask instructs the agent to execute or start an active probe task.
+message ScheduleProbeTask {
+  string task_id = 1;
+  string protocol = 2;
+  string target = 3;
+  int32 port = 4;
+  int32 count = 5;
+  int32 interval_ms = 6;
+  int32 timeout_ms = 7;
+}
+
+// CancelProbeTask cancels an ongoing probe task.
+message CancelProbeTask {
+  string task_id = 1;
+}
+
+// MeshConfigUpdate updates gossip join peers or mesh parameters.
+message MeshConfigUpdate {
+  repeated string add_peers = 1;
+  repeated string remove_peers = 2;
+  int32 probe_interval_ms = 3;
+}

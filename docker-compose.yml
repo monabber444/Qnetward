@@ -1,0 +1,282 @@
+name: qnetward
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. Edge Ingress & Reverse Proxy
+  # ---------------------------------------------------------------------------
+  edge:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      frontend:
+        condition: service_started
+      control-plane:
+        condition: service_healthy
+    ports:
+      - "80:8080"
+      - "8080:8080"
+    volumes:
+      - ./deploy/nginx.frontend-primary.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - qnetward-net
+
+  # ---------------------------------------------------------------------------
+  # 2. Next.js Unified Frontend
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    image: qnetward-web:latest
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      NETWATCHER_BACKEND_URL: http://control-plane:8080
+      NEXT_PUBLIC_PULSEMESH_URL: http://probe-agent-1:8081
+    ports:
+      - "3000:3000"
+    networks:
+      - qnetward-net
+
+  # ---------------------------------------------------------------------------
+  # 3. Control Plane & Ingestion Gateway
+  # ---------------------------------------------------------------------------
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qnetward-core:latest
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      objectstore:
+        condition: service_started
+    command: ["/app/netwatcher", "serve", "--ingestion-listen", "0.0.0.0:9090"]
+    environment:
+      NETWATCHER_LISTEN: 0.0.0.0:8080
+      NETWATCHER_DB_DSN: postgres://${POSTGRES_USER:-netwatcher}:${POSTGRES_PASSWORD:-netwatcher_secure_secret_password}@timescaledb:5432/${POSTGRES_DB:-netwatcher}?sslmode=disable
+      NETWATCHER_TIMESCALE: "true"
+      NETWATCHER_DB_BATCH: "250"
+      NETWATCHER_DB_FLUSH: 1s
+      NETWATCHER_DB_RETENTION: 720h
+      NETWATCHER_DB_CLEANUP: 1h
+      NETWATCHER_DB_MAX_OPEN: "25"
+      NETWATCHER_DB_MAX_IDLE: "10"
+      NETWATCHER_DB_CONN_MAX_LIFETIME: 30m
+      NETWATCHER_REDIS_ADDR: redis:6379
+      NETWATCHER_REDIS_DB: "0"
+      NETWATCHER_REDIS_PREFIX: netwatcher
+      NETWATCHER_REDIS_CACHE_TTL: 3s
+      NETWATCHER_S3_ENDPOINT: objectstore:8333
+      NETWATCHER_S3_ACCESS_KEY: ${OBJECTSTORE_ACCESS_KEY:-qnetward_admin_key}
+      NETWATCHER_S3_SECRET_KEY: ${OBJECTSTORE_SECRET_KEY:-qnetward_super_secret_access_key}
+      NETWATCHER_S3_BUCKET: netwatcher-artifacts
+      NETWATCHER_S3_REGION: us-east-1
+      NETWATCHER_S3_PREFIX: production
+      NETWATCHER_S3_SSL: "false"
+      NETWATCHER_PUBLIC_BASE_URL: ${NETWATCHER_PUBLIC_BASE_URL:-http://localhost:8080}
+      NETWATCHER_ALLOWED_ORIGINS: ${NETWATCHER_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:8080,http://127.0.0.1:3000,http://127.0.0.1:8080}
+      NETWATCHER_DEMO_ENABLED: ${NETWATCHER_DEMO_ENABLED:-true}
+      NETWATCHER_DEMO_NAME: ${NETWATCHER_DEMO_NAME:-Network Administrator}
+      NETWATCHER_DEMO_EMAIL: ${NETWATCHER_DEMO_EMAIL:-admin@qnetward.internal}
+      NETWATCHER_RESEND_API_KEY: ${NETWATCHER_RESEND_API_KEY:-}
+      NETWATCHER_EMAIL_FROM: ${NETWATCHER_EMAIL_FROM:-alerts@qnetward.internal}
+      NETWATCHER_EMAIL_REPLY_TO: ${NETWATCHER_EMAIL_REPLY_TO:-ops@qnetward.internal}
+    cap_add:
+      - NET_RAW
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - qnetward-net
+
+  # ---------------------------------------------------------------------------
+  # 4. PulseMesh 3-Node Probe Cluster
+  # ---------------------------------------------------------------------------
+  probe-agent-1:
+    image: qnetward-core:latest
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    entrypoint: ["/app/probe-agent"]
+    command:
+      - "--node-name=node-1"
+      - "--http-port=8081"
+      - "--gossip-port=7946"
+      - "--probe-port=9000"
+      - "--gateway-addr=control-plane:9090"
+      - "--capabilities=ping,tcpping,portscan,dns,mesh"
+      - "--labels=region=us-east,tier=edge"
+    ports:
+      - "8081:8081"
+      - "7946:7946/tcp"
+      - "7946:7946/udp"
+      - "9000:9000/udp"
+    networks:
+      - qnetward-net
+
+  probe-agent-2:
+    image: qnetward-core:latest
+    restart: unless-stopped
+    depends_on:
+      probe-agent-1:
+        condition: service_started
+      control-plane:
+        condition: service_healthy
+    entrypoint: ["/app/probe-agent"]
+    command:
+      - "--node-name=node-2"
+      - "--http-port=8082"
+      - "--gossip-port=7947"
+      - "--probe-port=9001"
+      - "--join=probe-agent-1:7946"
+      - "--gateway-addr=control-plane:9090"
+      - "--capabilities=ping,tcpping,portscan,dns,mesh"
+      - "--labels=region=us-west,tier=edge"
+    ports:
+      - "8082:8082"
+      - "7947:7947/tcp"
+      - "7947:7947/udp"
+      - "9001:9001/udp"
+    networks:
+      - qnetward-net
+
+  probe-agent-3:
+    image: qnetward-core:latest
+    restart: unless-stopped
+    depends_on:
+      probe-agent-1:
+        condition: service_started
+      control-plane:
+        condition: service_healthy
+    entrypoint: ["/app/probe-agent"]
+    command:
+      - "--node-name=node-3"
+      - "--http-port=8083"
+      - "--gossip-port=7948"
+      - "--probe-port=9002"
+      - "--join=probe-agent-1:7946"
+      - "--gateway-addr=control-plane:9090"
+      - "--capabilities=ping,tcpping,portscan,dns,mesh"
+      - "--labels=region=eu-central,tier=edge"
+    ports:
+      - "8083:8083"
+      - "7948:7948/tcp"
+      - "7948:7948/udp"
+      - "9002:9002/udp"
+    networks:
+      - qnetward-net
+
+  # ---------------------------------------------------------------------------
+  # 5. Hardware Collector & Host OS Telemetry
+  # ---------------------------------------------------------------------------
+  collector:
+    image: qnetward-core:latest
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    entrypoint: ["/app/collector"]
+    command:
+      - "--poll-interval=10s"
+      - "--trap-port=1162"
+      - "--flow-port=2055"
+      - "--profiles-dir=/app/drivers/profiles"
+    ports:
+      - "1162:1162/udp"
+      - "2055:2055/udp"
+    networks:
+      - qnetward-net
+
+  host-agent:
+    image: qnetward-core:latest
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    entrypoint: ["/app/host-agent"]
+    command:
+      - "--poll-interval=5s"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    networks:
+      - qnetward-net
+
+  # ---------------------------------------------------------------------------
+  # 6. Polyglot Storage & Cache Layer
+  # ---------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-netwatcher}
+      POSTGRES_USER: ${POSTGRES_USER:-netwatcher}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-netwatcher_secure_secret_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-netwatcher} -d ${POSTGRES_DB:-netwatcher}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - qnetward-net
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - qnetward-net
+
+  objectstore:
+    image: chrislusf/seaweedfs:latest
+    restart: unless-stopped
+    command: ["mini", "-dir=/data"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${OBJECTSTORE_ACCESS_KEY:-qnetward_admin_key}
+      AWS_SECRET_ACCESS_KEY: ${OBJECTSTORE_SECRET_KEY:-qnetward_super_secret_access_key}
+      S3_BUCKET: netwatcher-artifacts
+    ports:
+      - "8333:8333"
+    volumes:
+      - objectstore-data:/data
+    networks:
+      - qnetward-net
+
+# -----------------------------------------------------------------------------
+# Volumes & Networks
+# -----------------------------------------------------------------------------
+volumes:
+  timescaledb-data:
+  redis-data:
+  objectstore-data:
+
+networks:
+  qnetward-net:
+    driver: bridge
